@@ -24,47 +24,69 @@ def is_colab():
     return "COLAB_GPU" in os.environ
 
 
-if is_colab():
-    if not os.path.ismount("/content/drive"):
-        from google.colab import drive
+@dataclass
+class Config:
+    root_dir: str
+    work_dir: str
+    batch_size: int
+    images_dir: str
 
-        drive.mount("/content/drive")
+    data_representation: str = "latent"
+    vae_model_name: str = "stabilityai/sd-vae-ft-ema"
+    image_size: int = 256
+    latent_image_size: int = 32
+    latent_scale: float = 0.18215
+    num_heads: int = 8
+    dim: int = 512
+    dit_depth: int = 10
 
-    ROOT_DIR = "/content/drive/MyDrive/"
-    IMAGE_GENERATOR_DIR = ROOT_DIR + "ImageGenerator/"
-    sys.path.append(ROOT_DIR)
-    BATCH_SIZE = 96
-else:
-    ROOT_DIR = "./"
-    IMAGE_GENERATOR_DIR = ROOT_DIR
-    BATCH_SIZE = 2
+    @property
+    def latent_image_dir(self):
+        return os.path.join(self.work_dir, "temp_dir_for_latents")
 
-VAE_MODEL_NAME="stabilityai/sd-vae-ft-ema"
-IMAGES_DIR = ROOT_DIR + "images"
-LATENT_IMAGE_DIR = ROOT_DIR + "temp_dir_for_latents"
-LATENT_SCALE = 0.18215
+    @property
+    def dit_checkpoint_path(self):
+        return os.path.join(self.work_dir, "DiT.vae.pt")
 
-# DiT settings
-IMAGE_SIZE = 256
-LATENT_IMAGE_SIZE = 32
-NUM_HEADS = 8
-DIM = 512
-DIT_DEPTH = 10
 
-DIT_CHECKPOINT_PATH = ROOT_DIR + "/DiT.vae.pt"
+def create_config() -> Config:
+    content_drive = "/content/drive"
+    if is_colab():
+        if not os.path.ismount(content_drive):
+            from google.colab import drive
+            drive.mount(content_drive)
+        root_dir = os.path.join(content_drive, "MyDrive")
+        work_dir = os.path.join(root_dir, "ImageGenerator", "dit")
+        images_dir = os.path.join(root_dir, "images")
+        batch_size = 96
+    else:
+        root_dir = "./"
+        work_dir = root_dir
+        batch_size = 2
+        images_dir = "../images/my-images/"
 
-sys.path.append(ROOT_DIR)
+    return Config(
+        root_dir=root_dir,
+        work_dir=work_dir,
+        batch_size=batch_size,
+        images_dir=images_dir,
+    )
+
+
+config = create_config()
+
+sys.path.append(config.root_dir)
 import my_common as my
+logger = my.create_logger()
 
 
 @dataclass(frozen=True)
 class ShapeConfig:
     # Channel, Height, Width
-    image: tuple = (3, IMAGE_SIZE, IMAGE_SIZE)
-    latent: tuple = (4, LATENT_IMAGE_SIZE, LATENT_IMAGE_SIZE)
+    image: tuple = (3, config.image_size, config.image_size)
+    latent: tuple = (4, config.latent_image_size, config.latent_image_size)
 
 
-CONFIG_TYPE = "latent"
 
 
 def modulate(x, shift, scale):
@@ -76,9 +98,9 @@ def get_input_shape():
         "image": ShapeConfig.image,
         "latent": ShapeConfig.latent,
     }
-    if CONFIG_TYPE not in shapes:
-        raise ValueError(f"Unknown CONFIG_TYPE: {CONFIG_TYPE}")
-    return shapes[CONFIG_TYPE]
+    if config.data_representation not in shapes:
+        raise ValueError(f"Unknown data representation type: {config.data_representation}")
+    return shapes[config.data_representation]
 
 
 def debug_diffusion(real, x_t, x0_pred, ema_cleared, from_pure_noise):
@@ -92,7 +114,9 @@ def debug_diffusion(real, x_t, x0_pred, ema_cleared, from_pure_noise):
     class Visualizer:
         def __init__(self, image_type="latent"):
             if image_type == "image":
-                self.vae = ImageLatentManager.VAEManager(VAE_MODEL_NAME).create_vae()
+                self.vae = ImageLatentManager.VAEManager(
+                    config.vae_model_name
+                ).create_vae()
             else:
                 self.vae = None
 
@@ -132,24 +156,20 @@ def debug_diffusion(real, x_t, x0_pred, ema_cleared, from_pure_noise):
 
 
 def test_image_latent_manager():
-    # Initialize the manager
     manager = ImageLatentManager()
 
-    print("Step 1: Creating latents from dataset...")
-    manager.save_latent_from_image_dataset()  # creates and caches latents
-
-    print("Step 2: Creating dataloader...")
+    logger.info("Creating dataloader...")
     dataloader = manager.get_dataloader()
 
-    print("Step 3: Loading one batch of latents...")
+    logger.info("Loading one batch of latents...")
     for _, latent_batch in enumerate(dataloader):
         # latent_batch shape: (B, 4, H, W)
-        print(f"Loaded latent batch shape: {latent_batch.shape}")
+        logger.info(f"Loaded latent batch shape: {latent_batch.shape}")
 
         # Take the first latent in the batch
         first_latent = latent_batch[0:1]
 
-        print("Step 4: Converting latent back to image...")
+        logger.info("Converting latent back to image...")
         images = manager.latents_to_images(first_latent)
 
         # Display the image using matplotlib
@@ -158,6 +178,7 @@ def test_image_latent_manager():
         plt.title("Reconstructed Image from Latent")
         plt.show()
         break  # only process first batch for the test
+
 
 def cosine_schedule(num_timesteps=1000, s=0.008):
     def f(t):
@@ -193,8 +214,7 @@ class ImageLatentManager:
             """Create a VAE and keep it in GPU memory until program ends."""
             if self.vae is None:
                 self.vae = AutoencoderKL.from_pretrained(
-                    self.model_name,
-                    torch_dtype=torch.float16
+                    self.model_name, torch_dtype=torch.float16
                 ).to(my.DEVICE)
                 self.vae.eval()
             return self.vae
@@ -210,10 +230,8 @@ class ImageLatentManager:
                 self.vae = None
                 torch.cuda.empty_cache()
 
-    def __init__(
-        self
-    ):
-        self.latent_dir = LATENT_IMAGE_DIR
+    def __init__(self):
+        self.latent_dir = config.latent_image_dir
         self.transform = transforms.Compose(
             [
                 transforms.RandomHorizontalFlip(p=0.5),
@@ -226,34 +244,38 @@ class ImageLatentManager:
             ]
         )
 
-
-    def cache_latents(self, dataset):
+    def cache_latents_from_image_dataset(self):
         if os.path.exists(self.latent_dir):
-            print(f"{self.latent_dir} directory already exists. Skip to generate latent files")
+            logger.info(
+                f"{self.latent_dir} directory already exists. Skip to generate latent files"
+            )
         else:
+            logger.info("Creating latents from dataset...")
+            dataset = my.cropped_dataset(
+                config.images_dir,
+                crop_size=512,
+                max_num_patches_per_image=2,
+                transform=self.transform,
+                keep_first_full_scale=True,
+            )
             os.makedirs(self.latent_dir)
-
             dataloader = DataLoader(dataset, batch_size=4, shuffle=False)
-
             counter = 0
-            with ImageLatentManager.VAEManager(VAE_MODEL_NAME) as vae:
-                for (images, _) in dataloader:
+            with ImageLatentManager.VAEManager(config.vae_model_name) as vae:
+                for images, _ in dataloader:
                     images = images.to(my.DEVICE, dtype=torch.float16)
                     with torch.inference_mode():
-                        latents = vae.encode(images).latent_dist.mode() * LATENT_SCALE
+                        latents = (
+                            vae.encode(images).latent_dist.mode() * config.latent_scale
+                        )
                     # Save each latent separately
                     for latent in latents:
-                        torch.save(latent.cpu(), f"{self.latent_dir}/latent_{counter}.pt")
+                        torch.save(
+                            latent.cpu(), f"{self.latent_dir}/latent_{counter}.pt"
+                        )
                         counter += 1
 
-            print(f"Saved latents to {self.latent_dir}")
-
-    def save_latent_from_image_dataset(self):
-        dataset = my.cropped_dataset(
-            IMAGES_DIR, crop_size=512, max_num_patches_per_image=2, transform=self.transform, keep_first_full_scale = True
-        )
-        self.cache_latents(dataset)
-
+            logger.info(f"Saved latents to {self.latent_dir}")
 
     class LatentPatchDataset(Dataset):
         def __init__(self, latent_dir, crop_size=None):
@@ -271,19 +293,21 @@ class ImageLatentManager:
             latent = torch.load(self.files[idx])
 
             if self.crop_size:
-                C,H,W = latent.shape
+                C, H, W = latent.shape
                 top = random.randint(0, H - self.crop_size)
                 left = random.randint(0, W - self.crop_size)
-                latent = latent[:, top:top+self.crop_size, left:left+self.crop_size]
+                latent = latent[
+                    :, top : top + self.crop_size, left : left + self.crop_size
+                ]
 
             return latent
 
     def get_dataloader(self):
+        self.cache_latents_from_image_dataset()
         latent_dataset = ImageLatentManager.LatentPatchDataset(
-            latent_dir=self.latent_dir,
-            crop_size=LATENT_IMAGE_SIZE
+            latent_dir=self.latent_dir, crop_size=config.latent_image_size
         )
-        return DataLoader(latent_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        return DataLoader(latent_dataset, batch_size=config.batch_size, shuffle=True)
 
     def latents_to_images(self, latents):
         """
@@ -291,7 +315,7 @@ class ImageLatentManager:
         Returns a PIL images.
         """
         pil_images = []
-        with ImageLatentManager.VAEManager(VAE_MODEL_NAME) as vae:
+        with ImageLatentManager.VAEManager(config.vae_model_name) as vae:
             for latent in latents:
                 if latent.dim() == 3:
                     latent = latent.unsqueeze(0)
@@ -314,7 +338,7 @@ class ImageLatentManager:
         latent = latent.to(vae.device, dtype=torch.float16)
 
         with torch.no_grad():
-            img = vae.decode(latent / LATENT_SCALE).sample
+            img = vae.decode(latent / config.latent_scale).sample
             img = (img / 2 + 0.5).clamp(0, 1)  # [1,C,H,W]
 
         img = img[0].cpu()
@@ -324,6 +348,7 @@ class ImageLatentManager:
         img = (img * 255).astype("uint8")
 
         return Image.fromarray(img)
+
 
 class TimestepEmbedder(nn.Module):
     """
@@ -372,7 +397,9 @@ class DiTBlock(nn.Module):
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
 
-    def __init__(self, hidden_size, num_heads=NUM_HEADS, mlp_ratio=4.0, **block_kwargs):
+    def __init__(
+        self, hidden_size, num_heads=config.num_heads, mlp_ratio=4.0, **block_kwargs
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(
@@ -405,7 +432,7 @@ class DiTBlock(nn.Module):
 
 
 class DiffusionTransformer(nn.Module):
-    def __init__(self, dim=DIM, depth=DIT_DEPTH, n_classes=10, patch=2):
+    def __init__(self, dim=config.dim, depth=config.dit_depth, n_classes=10, patch=2):
         super().__init__()
         channels, H, W = get_input_shape()
         self.channels = channels
@@ -444,7 +471,7 @@ class DiffusionTransformer(nn.Module):
             nn.init.zeros_(block.mlp.fc1.bias)
             nn.init.zeros_(block.mlp.fc2.bias)
 
-            # 🔥 Very important for adaLN-Zero:
+            # Very important for adaLN-Zero:
             # Initialize modulation layer to zero
             nn.init.zeros_(block.adaLN_modulation[1].weight)
             nn.init.zeros_(block.adaLN_modulation[1].bias)
@@ -475,10 +502,10 @@ class DiffusionTransformer(nn.Module):
         return x
 
 
-def print_basic_info(num_epochs, epoch):
+def log_basic_info(num_epochs, epoch):
     now = datetime.datetime.now()
-    print("Current date and time::", now.strftime("%Y-%m-%d %H:%M:%S"))
-    print(f"Epoch [{epoch+1}/{num_epochs}]")
+    logger.info(f"Current date and time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Epoch [{epoch+1}/{num_epochs}]")
 
 
 class DiffusionTrainer:
@@ -506,9 +533,8 @@ class DiffusionTrainer:
     ):
 
         self.dataloader = dataloader
-        self.mode = CONFIG_TYPE
         self.num_epochs = num_epochs
-        self.checkpoint_path = DIT_CHECKPOINT_PATH
+        self.checkpoint_path = config.dit_checkpoint_path
 
         self.betas = cosine_schedule(num_timesteps).to(my.DEVICE)
         self.alphas = 1 - self.betas
@@ -532,30 +558,28 @@ class DiffusionTrainer:
             return 0.01 + 0.99 * (current_step / warmup_steps)  # linear warmup
         return 1.0
 
-    def print_info(self, epoch, loss, ema_loss):
+    def log_info(self, epoch, loss, ema_loss):
         avg_loss = self.multi_loss_tracker.calculate_loss("loss", loss)
         avg_ema_loss = self.multi_loss_tracker.calculate_loss("ema_loss", ema_loss)
 
-        print_basic_info(self.num_epochs, epoch)
-        print(f"Avg student loss: {avg_loss:.4f}")
-        print(f"Avg master (Ema) loss: {avg_ema_loss:.4f}")
+        log_basic_info(self.num_epochs, epoch)
+        logger.info(f"Avg student loss: {avg_loss:.4f}")
+        logger.info(f"Avg master (Ema) loss: {avg_ema_loss:.4f}")
 
     def show_training_state(
         self, loss, ema_loss, real, x_t, pred_noise, ema_pred_noise, epoch, t
     ):
 
-        self.print_info(epoch, loss, ema_loss)
-        print("t:", t[0].item(), "step:", self.step)
-        if self.step % 3 == 0:
-            self.save_checkpoint()
+        self.log_info(epoch, loss, ema_loss)
+        logger.info(f"t: {t[0].item()} step: {self.step}")
         real = real[0].detach().cpu()
         x_t = x_t[0].detach().cpu()
 
         x0_pred = self.predict_x0(x_t, pred_noise, t)
         ema_x0_pred = self.predict_x0(x_t, ema_pred_noise, t)
-        print("start generating from pure noise", datetime.datetime.now())
+        logger.info(f"Start generating from pure noise. {datetime.datetime.now()}")
         from_pure_noise = self.generate_image_from_pure_noise()
-        print("finished generating from pure noise", datetime.datetime.now())
+        logger.info(f"Finished generating from pure noise. {datetime.datetime.now()}")
 
         debug_diffusion(real, x_t, x0_pred, ema_x0_pred, from_pure_noise)
 
@@ -619,8 +643,9 @@ class DiffusionTrainer:
         self.scheduler.step()
         self.ema.update()
 
-        if self.step % 10 == 0:
+        if self.step % 20 == 0:
             with torch.no_grad():  # Saves memory!
+                self.save_checkpoint()
                 ema_pred_noise = self.ema.ema_model(x_t, t)
                 ema_loss = ((ema_pred_noise - noise) ** 2).mean()
                 self.show_training_state(
@@ -643,6 +668,8 @@ class DiffusionTrainer:
                 self.train_step(real, epoch)
 
     def save_checkpoint(self):
+        logger.info(f"Save checkpoint: {self.checkpoint_path}")
+
         checkpoint = {
             "step": self.step,
             "model_state": self.model.state_dict(),
@@ -651,13 +678,13 @@ class DiffusionTrainer:
             "ema_state": self.ema.state_dict(),
         }
         torch.save(checkpoint, self.checkpoint_path)
-        print(f"Checkpoint saved: {self.checkpoint_path}")
+        logger.info(f"Checkpoint saved: {self.checkpoint_path}")
 
     def load_or_init(self):
-        print(f"\n::: DIT model:::\n")
+        logger.info(f"\n::: DIT model:::\n")
         self.model = DiffusionTransformer().to(my.DEVICE)
         if os.path.exists(self.checkpoint_path):
-            print("Load model checkpoint")
+            logger.info("Load model checkpoint")
             checkpoint = torch.load(self.checkpoint_path, map_location=my.DEVICE)
             # model loaded first since the loaded model should be added to ema
             self.model.load_state_dict(checkpoint["model_state"])
@@ -681,18 +708,26 @@ class DiffusionTrainer:
             self.ema.load_state_dict(checkpoint["ema_state"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state"])
             self.scheduler.load_state_dict(checkpoint["scheduler_state"])
-            print(f"Checkpoint loaded: {self.checkpoint_path}")
+            logger.info(f"Checkpoint loaded: {self.checkpoint_path}")
         else:
-            print("No checkpoint found — initialized new model and optimizer.")
+            logger.info("No checkpoint found — initialized new model and optimizer.")
             self.step = 0
 
         my.print_parameter_summary(self.model)
 
 
+class LatentDiffusionTrainer(DiffusionTrainer):
+    pass
+
+
+class PixelDiffusionTrainer(DiffusionTrainer):
+    pass
+
+
 def train():
     dataloader = ImageLatentManager().get_dataloader()
 
-    trainer = DiffusionTrainer(
+    trainer = LatentDiffusionTrainer(
         dataloader=dataloader,
         num_timesteps=600,
         num_epochs=100000,
@@ -701,7 +736,7 @@ def train():
 
 
 if __name__ == "__main__":
-    print("Batch size:", BATCH_SIZE)
+    logger.info(f"Batch size: {config.batch_size}")
     torch.cuda.empty_cache()
 
     # test_image_latent_manager()

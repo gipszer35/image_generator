@@ -17,9 +17,12 @@ import torch.nn.functional as NNF
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
-NORMALIZE_TRANSFORM = transforms.Compose(
-    [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-)
+def normalize_transform():
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5),
+                             (0.5, 0.5, 0.5))
+    ])
 
 def create_logger():
     logger = logging.getLogger(__name__)
@@ -256,20 +259,20 @@ def load_images_cropped(directory_path, crop_size, max_num_patches_per_image, ke
 
 def cifar100_dataset():
     cifar_dataset = datasets.CIFAR100(
-        root="./data", download=True, transform=NORMALIZE_TRANSFORM
+        root="./data", download=True, transform=normalize_transform()
     )
     return cifar_dataset
 
 
 def cifar10_dataset():
     cifar_dataset = datasets.CIFAR10(
-        root="./data", download=True, transform=NORMALIZE_TRANSFORM
+        root="./data", download=True, transform=normalize_transform()
     )
     return cifar_dataset
 
 
 def cropped_dataset(
-    image_dir, crop_size, max_num_patches_per_image=100, transform=NORMALIZE_TRANSFORM, keep_first_full_scale=False
+    image_dir, crop_size, max_num_patches_per_image=100, transform=normalize_transform(), keep_first_full_scale=False
 ):
     cropped = load_images_cropped(image_dir, crop_size, max_num_patches_per_image, keep_first_full_scale)
     cropped_dataset = CroppedImageDataset(cropped, transform=transform)
