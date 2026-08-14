@@ -257,16 +257,16 @@ def load_images_cropped(directory_path, crop_size, max_num_patches_per_image, ke
         return np.empty((0, crop_size, crop_size, 3), dtype=np.float32)
 
 
-def cifar100_dataset():
+def cifar100_dataset(root="./data"):
     cifar_dataset = datasets.CIFAR100(
-        root="./data", download=True, transform=normalize_transform()
+        root=root, download=True, transform=normalize_transform()
     )
     return cifar_dataset
 
 
-def cifar10_dataset():
+def cifar10_dataset(root="./data"):
     cifar_dataset = datasets.CIFAR10(
-        root="./data", download=True, transform=normalize_transform()
+        root=root, download=True, transform=normalize_transform()
     )
     return cifar_dataset
 
