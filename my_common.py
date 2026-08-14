@@ -13,16 +13,92 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torchvision.models as models
 import torch.nn.functional as NNF
+from collections import deque
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
+
+def save_checkpoint(model, optimizer, path):
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        },
+        path,
+    )
+
+
+def load_checkpoint(model, optimizer, path):
+    checkpoint = torch.load(path, map_location=DEVICE)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    print(f"Loaded model from: {path}")
+
+    if optimizer and "optimizer_state_dict" in checkpoint:
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            print("Loaded optimizer state.")
+        except Exception as e:
+            print(f"Optimizer state not loaded: {e}")
+
+
+
+def load_checkpoint_if_exists(model, optimizer, path):
+
+    if os.path.exists(path):
+        print("Load checkpoint")
+        load_checkpoint(model, optimizer, path)
+    else:
+        print("No checkpoint found — initialized new model and optimizer.")
+    return model, optimizer
+
+
+def print_parameter_summary(model):
+    print(f"{'Parameter':40s} {'Shape':20s} {'# Params'}")
+    print("-" * 70)
+    total = 0
+    for name, p in model.named_parameters():
+        n = p.numel()
+        total += n
+        print(f"{name:40s} {str(list(p.shape)):20s} {n}")
+    print("-" * 70)
+    print("Total parameters:", total)
+
+
+class GaussianNoise(nn.Module):
+    def __init__(self, sigma=0.1):
+        super().__init__()
+        self.sigma = sigma
+
+    def forward(self, x):
+        if self.training and self.sigma > 0:
+            noise = torch.randn_like(x)
+            return x * (1 - self.sigma) + noise * self.sigma
+        return x
+
+
+class MultiLossTracker:
+    def __init__(self, maxlen=1000):
+        self.maxlen = maxlen
+        self.queues = {}  # stores name -> deque
+
+    def calculate_loss(self, loss_name, loss_value):
+        if loss_name not in self.queues:
+            self.queues[loss_name] = deque(maxlen=self.maxlen)
+
+        self.queues[loss_name].append(loss_value)
+
+        valid_losses = [x for x in self.queues[loss_name] if x is not None]
+        if not valid_losses:
+            return 0.0
+        return sum(valid_losses) / len(valid_losses)
+
+
 def normalize_transform():
-    return transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5),
-                             (0.5, 0.5, 0.5))
-    ])
+    return transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+    )
+
 
 def create_logger():
     logger = logging.getLogger(__name__)
@@ -41,6 +117,7 @@ def create_logger():
 
     return logger
 
+
 def cosine_beta_schedule(timesteps, s=0.008):
     """
     Cosine schedule as proposed in https://arxiv.org
@@ -51,6 +128,7 @@ def cosine_beta_schedule(timesteps, s=0.008):
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clamp(betas, 0.0001, 0.9999)
+
 
 class TimestepEmbedder(nn.Module):
     """
@@ -92,6 +170,11 @@ class TimestepEmbedder(nn.Module):
         t_freq = self.timestep_embedding(t)
         t_emb = self.mlp(t_freq)
         return t_emb
+
+
+# ================================================
+# === Image manipulation functions and classes ===
+# ================================================
 
 
 class CroppedImageDataset(Dataset):
@@ -157,44 +240,9 @@ class SRLoss(nn.Module):
         return pixel + self.weight * percep
 
 
-def save_checkpoint(model, optimizer, path):
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        },
-        path,
-    )
-
-
-def load_checkpoint(model, optimizer, path):
-    checkpoint = torch.load(path, map_location=DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    print(f"Loaded model from: {path}")
-
-    if optimizer and "optimizer_state_dict" in checkpoint:
-        try:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            print("Loaded optimizer state.")
-        except Exception as e:
-            print(f"Optimizer state not loaded: {e}")
-
-
-def load_checkpoint_if_exists(model, optimizer, path):
-
-    if os.path.exists(path):
-        print("Load checkpoint")
-        load_checkpoint(model, optimizer, path)
-    else:
-        print("No checkpoint found — initialized new model and optimizer.")
-    return model, optimizer
-
-
-def test_function():
-    print("test works")
-
-
-def load_images_cropped(directory_path, crop_size, max_num_patches_per_image, keep_first_full_scale):
+def load_images_cropped(
+    directory_path, crop_size, max_num_patches_per_image, keep_first_full_scale
+):
     image_paths = [
         os.path.join(directory_path, fname)
         for fname in os.listdir(directory_path)
@@ -222,7 +270,9 @@ def load_images_cropped(directory_path, crop_size, max_num_patches_per_image, ke
                         scale = 1
                     else:
                         # Random scale that still allows a valid crop
-                        scale = torch.empty(1).uniform_(crop_size / min_side, 1.0).item()
+                        scale = (
+                            torch.empty(1).uniform_(crop_size / min_side, 1.0).item()
+                        )
                     new_w = int(w * scale)
                     new_h = int(h * scale)
                     resized = img.resize((new_w, new_h), Image.BICUBIC)
@@ -257,6 +307,20 @@ def load_images_cropped(directory_path, crop_size, max_num_patches_per_image, ke
         return np.empty((0, crop_size, crop_size, 3), dtype=np.float32)
 
 
+def cropped_dataset(
+    image_dir,
+    crop_size,
+    max_num_patches_per_image=100,
+    transform=normalize_transform(),
+    keep_first_full_scale=False,
+):
+    cropped = load_images_cropped(
+        image_dir, crop_size, max_num_patches_per_image, keep_first_full_scale
+    )
+    cropped_dataset = CroppedImageDataset(cropped, transform=transform)
+    return cropped_dataset
+
+
 def cifar100_dataset(root="./data"):
     cifar_dataset = datasets.CIFAR100(
         root=root, download=True, transform=normalize_transform()
@@ -269,14 +333,6 @@ def cifar10_dataset(root="./data"):
         root=root, download=True, transform=normalize_transform()
     )
     return cifar_dataset
-
-
-def cropped_dataset(
-    image_dir, crop_size, max_num_patches_per_image=100, transform=normalize_transform(), keep_first_full_scale=False
-):
-    cropped = load_images_cropped(image_dir, crop_size, max_num_patches_per_image, keep_first_full_scale)
-    cropped_dataset = CroppedImageDataset(cropped, transform=transform)
-    return cropped_dataset
 
 
 def mixed_dataloader(datasets, batch_size):
@@ -332,30 +388,6 @@ def display_images(generated_images, dpi=100):
 
     plt.tight_layout()
     plt.show()
-
-
-def print_parameter_summary(model):
-    print(f"{'Parameter':40s} {'Shape':20s} {'# Params'}")
-    print("-" * 70)
-    total = 0
-    for name, p in model.named_parameters():
-        n = p.numel()
-        total += n
-        print(f"{name:40s} {str(list(p.shape)):20s} {n}")
-    print("-" * 70)
-    print("Total parameters:", total)
-
-
-class GaussianNoise(nn.Module):
-    def __init__(self, sigma=0.1):
-        super().__init__()
-        self.sigma = sigma
-
-    def forward(self, x):
-        if self.training and self.sigma > 0:
-            noise = torch.randn_like(x)
-            return x * (1 - self.sigma) + noise * self.sigma
-        return x
 
 
 def normalize(image):

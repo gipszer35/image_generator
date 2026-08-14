@@ -11,7 +11,6 @@ import os, sys
 import matplotlib.pyplot as plt
 import torchvision.transforms as T
 from dataclasses import dataclass
-from collections import deque
 from timm.models.vision_transformer import Attention, Mlp
 from torch.optim.lr_scheduler import LambdaLR
 from ema_pytorch import EMA
@@ -52,16 +51,13 @@ class Config:
 def create_config() -> Config:
     content_drive = "/content/drive"
     if is_colab():
-        if not os.path.ismount(content_drive):
-            from google.colab import drive
-            drive.mount(content_drive)
         root_dir = os.path.join(content_drive, "MyDrive")
         work_dir = os.path.join(root_dir, "ImageGenerator", "dit")
         images_dir = os.path.join(root_dir, "images")
         batch_size = 96
     else:
-        root_dir = "./"
-        work_dir = root_dir
+        root_dir = "../"
+        work_dir = "./"
         batch_size = 2
         images_dir = "../images/my-images/"
 
@@ -75,8 +71,16 @@ def create_config() -> Config:
 
 config = create_config()
 
+if is_colab():
+    if not os.path.ismount(config.content_drive):
+        from google.colab import drive
+
+        drive.mount(config.content_drive)
+
 sys.path.append(config.root_dir)
+sys.path.append(config.work_dir)
 import my_common as my
+
 logger = my.create_logger()
 
 
@@ -85,8 +89,6 @@ class ShapeConfig:
     # Channel, Height, Width
     image: tuple = (3, config.image_size, config.image_size)
     latent: tuple = (4, config.latent_image_size, config.latent_image_size)
-
-
 
 
 def modulate(x, shift, scale):
@@ -99,7 +101,9 @@ def get_input_shape():
         "latent": ShapeConfig.latent,
     }
     if config.data_representation not in shapes:
-        raise ValueError(f"Unknown data representation type: {config.data_representation}")
+        raise ValueError(
+            f"Unknown data representation type: {config.data_representation}"
+        )
     return shapes[config.data_representation]
 
 
@@ -112,35 +116,19 @@ def debug_diffusion(real, x_t, x0_pred, ema_cleared, from_pure_noise):
     _, axes = plt.subplots(1, 4, figsize=(12, 3))
 
     class Visualizer:
-        def __init__(self, image_type="latent"):
-            if image_type == "image":
-                self.vae = ImageLatentManager.VAEManager(
-                    config.vae_model_name
-                ).create_vae()
-            else:
-                self.vae = None
+        def __init__(self):
+            self.vae = ImageLatentManager.VAEManager(config.vae_model_name).create_vae()
 
         def show(self, ax, img, title):
             if isinstance(img, torch.Tensor):
                 img = img.detach().cpu()
-
-            if self.vae:
-                pil_img = ImageLatentManager.latent_to_image(self.vae, img)
-                ax.imshow(pil_img)
-            else:
-                if img.ndim == 3 and img.shape[0] == 4:
-                    img = img[:3]
-                img = normalize(img)
-
-                if img.ndim == 3 and img.shape[0] == 1:
-                    ax.imshow(img.squeeze(0), cmap="gray")
-                else:
-                    ax.imshow(img.permute(1, 2, 0))
+            pil_img = ImageLatentManager.latent_to_image(self.vae, img)
+            ax.imshow(pil_img)
 
             ax.set_title(title)
             ax.axis("off")
 
-    visualizer = Visualizer("image")
+    visualizer = Visualizer()
 
     visualizer.show(axes[0], real, "Real")
     visualizer.show(axes[1], x_t, "Noised")
@@ -153,41 +141,6 @@ def debug_diffusion(real, x_t, x0_pred, ema_cleared, from_pure_noise):
     _, ax = plt.subplots()
     visualizer.show(ax, from_pure_noise, "From pure noise")
     plt.show()
-
-
-def test_image_latent_manager():
-    manager = ImageLatentManager()
-
-    logger.info("Creating dataloader...")
-    dataloader = manager.get_dataloader()
-
-    logger.info("Loading one batch of latents...")
-    for _, latent_batch in enumerate(dataloader):
-        # latent_batch shape: (B, 4, H, W)
-        logger.info(f"Loaded latent batch shape: {latent_batch.shape}")
-
-        # Take the first latent in the batch
-        first_latent = latent_batch[0:1]
-
-        logger.info("Converting latent back to image...")
-        images = manager.latents_to_images(first_latent)
-
-        # Display the image using matplotlib
-        plt.imshow(images[0])
-        plt.axis("off")
-        plt.title("Reconstructed Image from Latent")
-        plt.show()
-        break  # only process first batch for the test
-
-
-def cosine_schedule(num_timesteps=1000, s=0.008):
-    def f(t):
-        return torch.cos((t / num_timesteps + s) / (1 + s) * 0.5 * math.pi) ** 2
-
-    x = torch.linspace(0, num_timesteps, num_timesteps + 1)
-    alphas_cumprod = f(x) / f(torch.tensor(0.0))
-    betas = 1 - alphas_cumprod[1:] / alphas_cumprod[:-1]
-    return torch.clamp(betas, 1e-5, 0.999)
 
 
 class ImageLatentManager:
@@ -502,28 +455,7 @@ class DiffusionTransformer(nn.Module):
         return x
 
 
-def log_basic_info(num_epochs, epoch):
-    now = datetime.datetime.now()
-    logger.info(f"Current date and time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"Epoch [{epoch+1}/{num_epochs}]")
-
-
 class DiffusionTrainer:
-    class MultiLossTracker:
-        def __init__(self, maxlen=1000):
-            self.maxlen = maxlen
-            self.queues = {}  # stores name -> deque
-
-        def calculate_loss(self, loss_name, loss_value):
-            if loss_name not in self.queues:
-                self.queues[loss_name] = deque(maxlen=self.maxlen)
-
-            self.queues[loss_name].append(loss_value)
-
-            valid_losses = [x for x in self.queues[loss_name] if x is not None]
-            if not valid_losses:
-                return 0.0
-            return sum(valid_losses) / len(valid_losses)
 
     def __init__(
         self,
@@ -536,11 +468,11 @@ class DiffusionTrainer:
         self.num_epochs = num_epochs
         self.checkpoint_path = config.dit_checkpoint_path
 
-        self.betas = cosine_schedule(num_timesteps).to(my.DEVICE)
+        self.betas = self.cosine_schedule(num_timesteps).to(my.DEVICE)
         self.alphas = 1 - self.betas
         self.alpha_bar = torch.cumprod(self.alphas, dim=0)
         self.num_timesteps = num_timesteps
-        self.multi_loss_tracker = DiffusionTrainer.MultiLossTracker()
+        self.multi_loss_tracker = my.MultiLossTracker()
         self.load_or_init()
 
     def predict_x0(self, x_t, pred_noise, t):
@@ -551,6 +483,15 @@ class DiffusionTrainer:
         x0_pred = (x_t - torch.sqrt(1 - a_bar) * pred_noise) / torch.sqrt(a_bar)
         return x0_pred
 
+    def cosine_schedule(self, num_timesteps=1000, s=0.008):
+        def f(t):
+            return torch.cos((t / num_timesteps + s) / (1 + s) * 0.5 * math.pi) ** 2
+
+        x = torch.linspace(0, num_timesteps, num_timesteps + 1)
+        alphas_cumprod = f(x) / f(torch.tensor(0.0))
+        betas = 1 - alphas_cumprod[1:] / alphas_cumprod[:-1]
+        return torch.clamp(betas, 1e-5, 0.999)
+
     @staticmethod
     def lr_lambda(current_step: int):
         warmup_steps = -1
@@ -558,11 +499,16 @@ class DiffusionTrainer:
             return 0.01 + 0.99 * (current_step / warmup_steps)  # linear warmup
         return 1.0
 
+    def log_basic_info(self, epoch):
+        now = datetime.datetime.now()
+        logger.info(f"Current date and time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Epoch [{epoch+1}/{self.num_epochs}]")
+
     def log_info(self, epoch, loss, ema_loss):
         avg_loss = self.multi_loss_tracker.calculate_loss("loss", loss)
         avg_ema_loss = self.multi_loss_tracker.calculate_loss("ema_loss", ema_loss)
 
-        log_basic_info(self.num_epochs, epoch)
+        self.log_basic_info(epoch)
         logger.info(f"Avg student loss: {avg_loss:.4f}")
         logger.info(f"Avg master (Ema) loss: {avg_ema_loss:.4f}")
 
@@ -738,7 +684,5 @@ def train():
 if __name__ == "__main__":
     logger.info(f"Batch size: {config.batch_size}")
     torch.cuda.empty_cache()
-
-    # test_image_latent_manager()
 
     train()
