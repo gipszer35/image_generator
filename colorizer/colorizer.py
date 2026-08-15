@@ -24,12 +24,12 @@ class Config:
     work_dir: str
     content_drive: str
 
-    image_size: int = 256
-    lr: float = 1e-4
+    image_size: int = 512
+    lr: float = 2e-4
 
     @property
     def checkpoint_path(self):
-        return os.path.join(self.work_dir, "colorizer_256x256.pt")
+        return os.path.join(self.work_dir, "colorizer_512x512.pt")
 
 
 def create_config() -> Config:
@@ -38,7 +38,7 @@ def create_config() -> Config:
         root_dir = os.path.join(content_drive, "MyDrive")
         work_dir = os.path.join(root_dir, "ImageGenerator", "colorizer")
         images_dir = os.path.join(root_dir, "images")
-        batch_size = 32
+        batch_size = 10
     else:
         root_dir = "../"
         work_dir = "./"
@@ -116,9 +116,9 @@ class DataLoaderFactory:
 
 class UNetColorizer(nn.Module):
     """
-    Standard U-Net architecture designed for image colorization.
-    Combines feature maps from a multi-stage grayscale encoder with spatial
-    color hints at the bottleneck, using skip connections for detail preservation.
+    Standard U-Net architecture extended to 6 stages for 512x512 image colorization.
+    Downsamples the input 6 times to reach an 8x8 bottleneck, preserving deep
+    structural details and merging them with low-resolution spatial color hints.
     """
 
     class ConvBlock(nn.Module):
@@ -139,9 +139,15 @@ class UNetColorizer(nn.Module):
 
     def __init__(self):
         super().__init__()
+        c1 = 64
+        c2 = 128
+        c3 = 256
+        c4 = 512
+        c5 = 1024
+        bn = 1024 + 512  # bottleneck channels size
 
-        # Channel configurations for the downsampling path
-        encoder_channels = [1, 64, 128, 256, 512, 1024]
+        # Extended channel configurations for the 6-stage downsampling path
+        encoder_channels = [1, c1, c2, c3, c4, c5, bn]
 
         # Multi-stage feature extraction and downsampling modules
         self.encoders = nn.ModuleList(
@@ -150,7 +156,8 @@ class UNetColorizer(nn.Module):
                 for i in range(len(encoder_channels) - 1)
             ]
         )
-        self.pools = nn.ModuleList([nn.MaxPool2d(2) for _ in range(5)])
+        # Increased to 6 pools to match the 6-stage encoder path
+        self.pools = nn.ModuleList([nn.MaxPool2d(2) for _ in range(6)])
 
         # Dedicated processing network for the low-resolution color hints
         self.color_encoder = nn.Sequential(
@@ -160,29 +167,35 @@ class UNetColorizer(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Central processing block that merges encoder and color features
-        self.bottleneck = UNetColorizer.ConvBlock(1024 + 128, 1024)
+        # Central processing block that merges encoder features (1024) and color features (128)
+        self.bottleneck = UNetColorizer.ConvBlock(bn + 128, bn)
 
-        # Channel configurations for the upsampling path
-        decoder_channels = [1024, 512, 256, 128, 64]
+        # Extended channel configurations for the 6-stage upsampling path
+        decoder_channels = [c5, c4, c3, c2, c1, c1]
 
         # Spatial upsampling modules via transposed convolutions
         self.up_samplers = nn.ModuleList(
             [
                 nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
-                for in_ch, out_ch in zip(
-                    [1024] + decoder_channels[:-1], decoder_channels
+                for in_ch, out_ch in zip([bn] + decoder_channels[:-1], decoder_channels)
+            ]
+        )
+
+        skip_channels = list(reversed(encoder_channels[1:]))
+
+        self.decoders = nn.ModuleList(
+            [
+                UNetColorizer.ConvBlock(up_ch + skip_ch, out_ch)
+                for up_ch, skip_ch, out_ch in zip(
+                    decoder_channels,
+                    skip_channels,
+                    decoder_channels,
                 )
             ]
         )
 
-        # Reconstruction blocks that process combined upsampled and skip features
-        self.decoders = nn.ModuleList(
-            [UNetColorizer.ConvBlock(ch * 2, ch) for ch in decoder_channels]
-        )
-
         # Final projection layer to map features back to standard RGB channels
-        self.final_conv = nn.Conv2d(64, 3, kernel_size=1)
+        self.final_conv = nn.Conv2d(c1, 3, kernel_size=1)
 
     def forward(self, grayscale, color_hint):
         # 1. Feature extraction loop storing intermediate maps for skip connections
@@ -248,7 +261,8 @@ class Visualizer:
         image_display = ImageDisplay()
 
         # Pass individual axis elements from the subplots array
-        _, axes = plt.subplots(1, 3, figsize=(9, 3))
+        _, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=150)
+
         image_display.show(axes[0], real_image, "Original")
         image_display.show(axes[1], gray_image, "Grayscale")
         image_display.show(axes[2], color_hint, "Color Hint")
@@ -257,7 +271,7 @@ class Visualizer:
         plt.show()
 
         # Full-size result
-        _, ax = plt.subplots()
+        _, ax = plt.subplots(figsize=(8, 8))
         image_display.show(ax, colorized_image, "Colorized Result")
         plt.show()
 
@@ -292,8 +306,8 @@ class ColorizerTrainer:
         dataset = my.cropped_dataset(
             config.images_dir,
             crop_size=config.image_size,
-            max_num_patches_per_image=2,
-            keep_first_full_scale=True,
+            max_num_patches_per_image=1,
+            keep_first_full_scale=False,
         )
         dataloader_factory = DataLoaderFactory(config, data_dir, dataset)
         self.dataloader = dataloader_factory.get_dataloader()
@@ -313,19 +327,23 @@ class ColorizerTrainer:
         # Predict the full RGB reconstruction using our hint-guided model
         pred_rgb = self.model(gray, hint)
         # Calculate reconstruction mean squared error
-        mean_loss = ((pred_rgb - real) ** 2).mean()
+        mse_loss = ((pred_rgb - real) ** 2).mean()
         sr_loss = self.criterion(pred_rgb, real)
-        loss = mean_loss + sr_loss
+        loss = mse_loss + sr_loss
 
         avg_loss = self.multi_loss_tracker.calculate_loss("loss", loss)
+        avg_mse_loss = self.multi_loss_tracker.calculate_loss("mse_loss", mse_loss)
+        avg_sr_loss = self.multi_loss_tracker.calculate_loss("sr_loss", sr_loss)
+
+
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        if self.step % 50 == 0:
+        if self.step % 200 == 0:
             debug_trick = True
-            if self.step % 3:
+            if self.step % 3 == 0:
                 logger.info("Debug trick enabled: color hint replaced")
                 # DEBUG TRICK: Replace the entire color hint of batch index 0 with batch index 1
                 # If the model is working correctly, object 0 should take on the colors of object 1
@@ -343,6 +361,8 @@ class ColorizerTrainer:
                 f"Step: {self.step:,}\n"
                 f"Loss: {loss.item():.6f}\n"
                 f"Avg Loss: {avg_loss:.6f}\n"
+                f"Avg MSE Loss: {avg_mse_loss:.6f}\n"
+                f"Avg SR Loss: {avg_sr_loss:.6f}\n"
                 f"LR: {current_lr:.2e}\n"
                 f"Batch: {real.size(0)}"
             )
@@ -391,6 +411,8 @@ class ColorizerTrainer:
         if checkpoint:
             self.step = checkpoint["step"]
             self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = config.lr
             logger.info(f"Checkpoint loaded: {self.checkpoint_path}")
         else:
             logger.info("No checkpoint found — initialized new model and optimizer.")
