@@ -17,15 +17,16 @@ class Config:
     root_dir: str
     batch_size: int
     images_dir: str
+    paintings_dir: str
     work_dir: str
     content_drive: str
 
     image_size: int = 512
-    lr: float = 2e-5
+    lr: float = 1e-4
 
     @property
     def checkpoint_path(self):
-        return os.path.join(self.work_dir, "colorizer_512x512.pt")
+        return os.path.join(self.work_dir, "colorizer_sr.pt")
 
 
 def create_config() -> Config:
@@ -34,18 +35,22 @@ def create_config() -> Config:
         root_dir = os.path.join(content_drive, "MyDrive")
         work_dir = os.path.join(root_dir, "ImageGenerator", "colorizer")
         images_dir = os.path.join(root_dir, "images")
-        batch_size = 10
+        paintings_dir = os.path.join(root_dir, "paintings")
+
+        batch_size = 16
     else:
         root_dir = "../"
         work_dir = "./"
         batch_size = 2
         images_dir = "../images/my-images/"
+        paintings_dir = "../images/Impressionism/"
 
     return Config(
         root_dir=root_dir,
         work_dir=work_dir,
         batch_size=batch_size,
         images_dir=images_dir,
+        paintings_dir=paintings_dir,
         content_drive=content_drive,
     )
 
@@ -66,11 +71,21 @@ import colorizer_common as cc
 logger = my.create_logger()
 
 
-class UNetColorizer(nn.Module):
+class CategoryEmbedding(nn.Module):
+    def __init__(self, num_categories, channels, size=8):
+        super().__init__()
+        self.embedding = nn.Embedding(num_categories, channels)
+        self.size = size
+
+    def forward(self, category):
+        x = self.embedding(category)
+        return x[:, :, None, None].expand(-1, -1, self.size, self.size)
+
+
+class UNetColorizerSR(nn.Module):
     """
-    Standard U-Net architecture extended to 6 stages for 512x512 image colorization.
-    Downsamples the input 6 times to reach an 8x8 bottleneck, preserving deep
-    structural details and merging them with low-resolution spatial color hints.
+    U-Net architecture for colorizing 256x256 images using 64x64 spatial
+    color hints, while simultaneously generating a 512x512 colorized output.
     """
 
     class ConvBlock(nn.Module):
@@ -91,53 +106,56 @@ class UNetColorizer(nn.Module):
 
     def __init__(self):
         super().__init__()
-        c1 = 64
+        c0 = 64
+        c1 = 128
         c2 = 128
         c3 = 256
         c4 = 512
-        c5 = 1024
-        bn = 1024 + 512  # bottleneck channels size
+        bn = 1024  # bottleneck channels size
+        color_channels = 64
+        category_channel = 64
 
-        # Extended channel configurations for the 6-stage downsampling path
-        encoder_channels = [1, c1, c2, c3, c4, c5, bn]
+        # Extended channel configurations for the downsampling path
+        encoder_channels = [1, c0, c1, c2, c3, c4, bn]
 
         # Multi-stage feature extraction and downsampling modules
         self.encoders = nn.ModuleList(
             [
-                UNetColorizer.ConvBlock(encoder_channels[i], encoder_channels[i + 1])
+                UNetColorizerSR.ConvBlock(encoder_channels[i], encoder_channels[i + 1])
                 for i in range(len(encoder_channels) - 1)
             ]
         )
-        # Increased to 6 pools to match the 6-stage encoder path
-        self.pools = nn.ModuleList([nn.MaxPool2d(2) for _ in range(6)])
 
-        # Dedicated processing network for the low-resolution color hints
-        self.color_encoder = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+        # Downsample between encoder stages
+        self.pools = nn.ModuleList(
+            [nn.MaxPool2d(2) for _ in range(len(encoder_channels) - 2)]
         )
 
-        # Central processing block that merges encoder features (1024) and color features (128)
-        self.bottleneck = UNetColorizer.ConvBlock(bn + 128, bn)
+        self.color_encoder_64 = self._create_color_encoder(color_channels, downsample=0)
+        self.color_encoder_8 = self._create_color_encoder(color_channels, downsample=3)
 
-        # Extended channel configurations for the 6-stage upsampling path
-        decoder_channels = [c5, c4, c3, c2, c1, c1]
+        # Bottleneck block combining encoder features with color and category conditioning
+        self.bottleneck = UNetColorizerSR.ConvBlock(
+            bn + color_channels + category_channel, bn
+        )
 
-        # Spatial upsampling modules via transposed convolutions
+        # Extended channel configurations for the upsampling path
+        decoder_channels = [c4, c3, c2, c1, c0, c0]
+
+        decoder_input_channels = [bn, c4, c3, c2 + color_channels, c1, c0]
+
         self.up_samplers = nn.ModuleList(
             [
                 nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
-                for in_ch, out_ch in zip([bn] + decoder_channels[:-1], decoder_channels)
+                for in_ch, out_ch in zip(decoder_input_channels, decoder_channels)
             ]
         )
 
-        skip_channels = list(reversed(encoder_channels[1:]))
+        skip_channels = list(reversed(encoder_channels[:-1]))
 
         self.decoders = nn.ModuleList(
             [
-                UNetColorizer.ConvBlock(up_ch + skip_ch, out_ch)
+                UNetColorizerSR.ConvBlock(up_ch + skip_ch, out_ch)
                 for up_ch, skip_ch, out_ch in zip(
                     decoder_channels,
                     skip_channels,
@@ -145,38 +163,91 @@ class UNetColorizer(nn.Module):
                 )
             ]
         )
+        self.category_embedding = CategoryEmbedding(2, category_channel)
 
+        self.final_upsample = nn.ConvTranspose2d(
+            c0, c0, kernel_size=2, stride=2
+        )
         # Final projection layer to map features back to standard RGB channels
-        self.final_conv = nn.Conv2d(c1, 3, kernel_size=1)
+        self.final_conv = nn.Conv2d(c0, 3, kernel_size=1)
 
-    def forward(self, grayscale, color_hint):
-        # 1. Feature extraction loop storing intermediate maps for skip connections
+    def _create_color_encoder(self, color_channels, downsample=0):
+        # downsample controls the number of 2× spatial reductions.
+        # For example, downsample=3 reduces 64×64 → 32×32 → 16×16 → 8×8.
+        layers = [
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, color_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        ]
+
+        for _ in range(downsample):
+            layers.append(nn.MaxPool2d(2))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, grayscale, color_hint, category):
+        # Feature extraction loop storing intermediate maps for skip connections
         skip_connections = []
         x = grayscale
 
-        for enc, pool in zip(self.encoders, self.pools):
+        for i, enc in enumerate(self.encoders):
             s = enc(x)
-            skip_connections.append(s)
-            x = pool(s)
 
-        # 2. Process external color guidance and concatenate at the lowest resolution
-        hint_features = self.color_encoder(color_hint)
-        bottleneck_input = torch.cat((x, hint_features), dim=1)
+            if i < len(self.encoders) - 1:
+                skip_connections.append(s)
+                x = self.pools[i](s)
+            else:
+                x = s
+
+        # Process external color guidance at 8×8
+        hint_features = self.color_encoder_8(color_hint)
+
+        # Category embedding
+        category_features = self.category_embedding(category)
+
+        # Combine encoder, color, and category features
+        bottleneck_input = torch.cat((x, hint_features, category_features), dim=1)
         x = self.bottleneck(bottleneck_input)
 
-        # 3. Reconstruction loop combining upsampled features with corresponding skip maps
-        for up, dec, s in zip(
-            self.up_samplers, self.decoders, reversed(skip_connections)
+        # Color features at 64×64
+        color_64 = self.color_encoder_64(color_hint)
+
+        # Reconstruction loop combining upsampled features with corresponding skip maps
+        for i, (up, dec, s) in enumerate(
+            zip(
+                self.up_samplers,
+                self.decoders,
+                reversed(skip_connections),
+            )
         ):
+            # Add 64×64 color features before the corresponding upsampling
+            if i == 3:
+                x = torch.cat((x, color_64), dim=1)
+
             x = up(x)
             x = torch.cat((x, s), dim=1)
             x = dec(x)
 
+        x = self.final_upsample(x)
         # Output bounded between [-1, 1] via hyperbolic tangent activation
         return torch.tanh(self.final_conv(x))
 
 
-class ColorizerTrainer(cc.ColorizerTrainerBase):
+class CategoryDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, category):
+        self.dataset = dataset
+        self.category = category
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        image, _ = self.dataset[idx]
+        return image, self.category
+
+
+class ColorizerSRTrainer(cc.ColorizerTrainerBase):
 
     def __init__(self, model, num_epochs):
         super().__init__(model, config.lr)
@@ -186,12 +257,27 @@ class ColorizerTrainer(cc.ColorizerTrainerBase):
         data_dir = os.path.join(config.work_dir, "data")
         logger.info(f"Target data location is set to: {data_dir}")
 
-        dataset = my.cropped_dataset(
+        dataset_images = my.cropped_dataset(
             config.images_dir,
             crop_size=config.image_size,
             max_num_patches_per_image=1,
             keep_first_full_scale=False,
         )
+
+        dataset_paintings = my.cropped_dataset(
+            config.paintings_dir,
+            crop_size=config.image_size,
+            max_num_patches_per_image=1,
+            keep_first_full_scale=False,
+        )
+
+        dataset = torch.utils.data.ConcatDataset(
+            [
+                CategoryDataset(dataset_images, 0),  # image
+                CategoryDataset(dataset_paintings, 1),  # painting
+            ]
+        )
+
         dataloader_factory = cc.DataLoaderFactory(config, data_dir, dataset)
         self.dataloader = dataloader_factory.get_dataloader()
 
@@ -200,15 +286,21 @@ class ColorizerTrainer(cc.ColorizerTrainerBase):
         self.num_epochs = num_epochs
         self.checkpoint_path = config.checkpoint_path
 
-    def train_step(self, real, epoch):
+    def train_step(self, real, category, epoch):
         real = real.to(my.DEVICE)
+        category = category.to(my.DEVICE)
 
         # Extract grayscale target and generate 8x8 low-res color hint
         gray = T.functional.rgb_to_grayscale(real, num_output_channels=1)
-        hint = F.interpolate(real, size=(8, 8), mode="area")
+        # Downsample grayscale input to 256×256
+        gray = F.interpolate(gray, size=(256, 256), mode="area")
+
+        # Generate 64×64 color hint for the multi-scale color encoders
+        hint = F.interpolate(real, size=(64, 64), mode="area")
 
         # Predict the full RGB reconstruction using our hint-guided model
-        pred_rgb = self.model(gray, hint)
+        pred_rgb = self.model(gray, hint, category)
+
         # Calculate reconstruction mean squared error
         mse_loss = ((pred_rgb - real) ** 2).mean()
         sr_loss = self.criterion(pred_rgb, real)
@@ -228,7 +320,8 @@ class ColorizerTrainer(cc.ColorizerTrainerBase):
                 # DEBUG TRICK: Replace the entire color hint of batch index 0 with batch index 1
                 # If the model is working correctly, object 0 should take on the colors of object 1
                 hint[0] = hint[1].clone()
-                pred_rgb = self.model(gray, hint)
+                pred_rgb = self.model(gray, hint, category)
+
 
             self.save_checkpoint()
             current_lr = self.optimizer.param_groups[0]["lr"]
@@ -260,13 +353,13 @@ class ColorizerTrainer(cc.ColorizerTrainerBase):
 
     def train(self):
         for epoch in range(self.num_epochs):
-            for real, _ in self.dataloader:
-                self.train_step(real, epoch)
+            for real, category in self.dataloader:
+                self.train_step(real, category, epoch)
 
 
 def train():
-    model = UNetColorizer().to(my.DEVICE)
-    trainer = ColorizerTrainer(model, num_epochs=100000)
+    model = UNetColorizerSR().to(my.DEVICE)
+    trainer = ColorizerSRTrainer(model, num_epochs=100000)
     trainer.load_or_init()
     trainer.train()
 
