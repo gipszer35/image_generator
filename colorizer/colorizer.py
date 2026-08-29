@@ -183,8 +183,6 @@ class ColorizerTrainer(cc.ColorizerTrainerBase):
         self.step = 0
         self.criterion = my.SRLoss(perceptual_weight=0.1)
         self.multi_loss_tracker = my.MultiLossTracker()
-        data_dir = os.path.join(config.work_dir, "data")
-        logger.info(f"Target data location is set to: {data_dir}")
 
         dataset = my.cropped_dataset(
             config.images_dir,
@@ -192,7 +190,7 @@ class ColorizerTrainer(cc.ColorizerTrainerBase):
             max_num_patches_per_image=1,
             keep_first_full_scale=False,
         )
-        dataloader_factory = cc.DataLoaderFactory(config, data_dir, dataset)
+        dataloader_factory = cc.DataLoaderFactory(config, dataset)
         self.dataloader = dataloader_factory.get_dataloader()
 
         self.visualizer = cc.Visualizer()

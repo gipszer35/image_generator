@@ -37,7 +37,7 @@ def create_config() -> Config:
         images_dir = os.path.join(root_dir, "images")
         paintings_dir = os.path.join(root_dir, "paintings")
 
-        batch_size = 16
+        batch_size = 6
     else:
         root_dir = "../"
         work_dir = "./"
@@ -82,6 +82,47 @@ class CategoryEmbedding(nn.Module):
         return x[:, :, None, None].expand(-1, -1, self.size, self.size)
 
 
+class FinalUpscaleBlock(nn.Module):
+    def __init__(self, ch):
+        """
+        Final UNet upscaler.
+        Eliminates sawtooth artifacts while keeping lines sharp and unblurred.
+        """
+        super().__init__()
+
+        # The 5x5 kernel evaluates a wider local neighborhood to map smooth line trajectories.
+        self.pre_shuffle_conv = nn.Conv2d(ch, ch * 4, kernel_size=5, padding=2)
+        self.shuffle = nn.PixelShuffle(upscale_factor=2)
+        self.act1 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+        self.conv1 = nn.Conv2d(ch, ch, kernel_size=3, padding=1)
+        self.act2 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+        self.conv2 = nn.Conv2d(ch, ch, kernel_size=3, padding=1)
+        self.act3 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+        self.final_conv = nn.Conv2d(ch, 3, kernel_size=1)
+
+    def forward(self, x):
+        """
+        Args:
+            x : Input feature map of shape [Batch, ch, H, W]
+        Returns:
+            torch.Tensor: Upscaled feature map of shape [Batch, ch, H*2, W*2]
+        """
+        # Execute the 2x Upscale Safely
+        x_shuffled = self.pre_shuffle_conv(x)
+        x_up = self.shuffle(x_shuffled)  # Dim now: [Batch, ch, H*2, W*2]
+        x_up = self.act1(x_up)
+        x_features = self.conv1(x_up)
+        x_features = self.act2(x_features)
+
+        x_features = self.conv2(x_features)
+        x_features = self.act3(x_features)
+
+        return torch.tanh(self.final_conv(x_features))
+
+
 class UNetColorizerSR(nn.Module):
     """
     U-Net architecture for colorizing 256x256 images using 64x64 spatial
@@ -106,7 +147,7 @@ class UNetColorizerSR(nn.Module):
 
     def __init__(self):
         super().__init__()
-        c0 = 64
+        c0 = 256
         c1 = 128
         c2 = 128
         c3 = 256
@@ -114,6 +155,7 @@ class UNetColorizerSR(nn.Module):
         bn = 1024  # bottleneck channels size
         color_channels = 64
         category_channel = 64
+        final_ch = c0
 
         # Extended channel configurations for the downsampling path
         encoder_channels = [1, c0, c1, c2, c3, c4, bn]
@@ -164,12 +206,7 @@ class UNetColorizerSR(nn.Module):
             ]
         )
         self.category_embedding = CategoryEmbedding(2, category_channel)
-
-        self.final_upsample = nn.ConvTranspose2d(
-            c0, c0, kernel_size=2, stride=2
-        )
-        # Final projection layer to map features back to standard RGB channels
-        self.final_conv = nn.Conv2d(c0, 3, kernel_size=1)
+        self.final_block = FinalUpscaleBlock(final_ch)
 
     def _create_color_encoder(self, color_channels, downsample=0):
         # downsample controls the number of 2× spatial reductions.
@@ -229,9 +266,7 @@ class UNetColorizerSR(nn.Module):
             x = torch.cat((x, s), dim=1)
             x = dec(x)
 
-        x = self.final_upsample(x)
-        # Output bounded between [-1, 1] via hyperbolic tangent activation
-        return torch.tanh(self.final_conv(x))
+        return self.final_block(x)
 
 
 class CategoryDataset(torch.utils.data.Dataset):
@@ -254,8 +289,6 @@ class ColorizerSRTrainer(cc.ColorizerTrainerBase):
         self.step = 0
         self.criterion = my.SRLoss(perceptual_weight=0.1)
         self.multi_loss_tracker = my.MultiLossTracker()
-        data_dir = os.path.join(config.work_dir, "data")
-        logger.info(f"Target data location is set to: {data_dir}")
 
         dataset_images = my.cropped_dataset(
             config.images_dir,
@@ -270,6 +303,11 @@ class ColorizerSRTrainer(cc.ColorizerTrainerBase):
             max_num_patches_per_image=1,
             keep_first_full_scale=False,
         )
+        image_dataloader_factory = cc.DataLoaderFactory(config, dataset_images)
+        dataset_images = image_dataloader_factory.get_dataset()
+
+        paintings_dataloader_factory = cc.DataLoaderFactory(config, dataset_paintings)
+        dataset_paintings = paintings_dataloader_factory.get_dataset()
 
         dataset = torch.utils.data.ConcatDataset(
             [
@@ -278,7 +316,7 @@ class ColorizerSRTrainer(cc.ColorizerTrainerBase):
             ]
         )
 
-        dataloader_factory = cc.DataLoaderFactory(config, data_dir, dataset)
+        dataloader_factory = cc.DataLoaderFactory(config, dataset)
         self.dataloader = dataloader_factory.get_dataloader()
 
         self.visualizer = cc.Visualizer()
@@ -304,7 +342,8 @@ class ColorizerSRTrainer(cc.ColorizerTrainerBase):
         # Calculate reconstruction mean squared error
         mse_loss = ((pred_rgb - real) ** 2).mean()
         sr_loss = self.criterion(pred_rgb, real)
-        loss = mse_loss * 7 + sr_loss
+        mse_weight = 7
+        loss = mse_loss * mse_weight + sr_loss
 
         avg_loss = self.multi_loss_tracker.calculate_loss("loss", loss)
         avg_mse_loss = self.multi_loss_tracker.calculate_loss("mse_loss", mse_loss)
@@ -314,14 +353,14 @@ class ColorizerSRTrainer(cc.ColorizerTrainerBase):
         loss.backward()
         self.optimizer.step()
 
-        if self.step % 100 == 0:
+        if self.step % 50 == 0:
             if self.step % 7 == 0:
                 logger.info("Debug trick enabled: color hint replaced")
                 # DEBUG TRICK: Replace the entire color hint of batch index 0 with batch index 1
                 # If the model is working correctly, object 0 should take on the colors of object 1
-                hint[0] = hint[1].clone()
-                pred_rgb = self.model(gray, hint, category)
-
+                with torch.no_grad():
+                    hint[0] = hint[1]
+                    pred_rgb = self.model(gray, hint, category)
 
             self.save_checkpoint()
             current_lr = self.optimizer.param_groups[0]["lr"]
@@ -332,10 +371,13 @@ class ColorizerSRTrainer(cc.ColorizerTrainerBase):
             logger.info(
                 f"Epoch: {epoch + 1}/{self.num_epochs}\n"
                 f"Step: {self.step:,}\n"
-                f"Loss: {loss.item():.6f}\n"
-                f"Avg Loss: {avg_loss:.6f}\n"
+                f"MSE Loss: {mse_loss:.6f}\n"
+                f"SR Loss: {sr_loss:.6f}\n"
+                f"Loss: {loss.item():.6f} = {mse_loss.item():.6f} * {mse_weight} + {sr_loss.item():.6f}"
+                f" = {(mse_loss * mse_weight).item():.6f} + {sr_loss.item():.6f}\n"
                 f"Avg MSE Loss: {avg_mse_loss:.6f}\n"
                 f"Avg SR Loss: {avg_sr_loss:.6f}\n"
+                f"Avg Loss: {avg_loss:.6f}\n"
                 f"LR: {current_lr:.2e}\n"
                 f"Batch: {real.size(0)}"
             )

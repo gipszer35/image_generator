@@ -22,38 +22,41 @@ class DataLoaderFactory:
             k = random.choice([0, 1, 2, 3])
             return T.functional.rotate(img, k * 90)
 
-    def __init__(self, config, data_dir, dataset):
+    def __init__(self, config, dataset):
         self.config = config
-        self.data_dir = data_dir
         self.dataset = dataset
 
-    def get_dataloader(self) -> DataLoader:
-        """
-        Applies rotation and color jittering,
-        and returns the final PyTorch DataLoader.
-        """
-
-        # Override the dataset's transform attribute from the outside
+    def get_dataset(self):
         self.dataset.transform = T.Compose(
             [
-                # Converts to PIL ONLY if the input is a NumPy array, otherwise passes it through
                 T.Lambda(
                     lambda img: (
                         T.ToPILImage()(img) if isinstance(img, np.ndarray) else img
                     )
                 ),
-                # Rotate the image into one of the 4 main orientations
                 DataLoaderFactory.Random90Rotation(),
-                # Carefully jitter color, brightness, contrast, and saturation
                 T.ColorJitter(
-                    brightness=0.15, contrast=0.15, saturation=0.15, hue=0.05
+                    brightness=0.15,
+                    contrast=0.15,
+                    saturation=0.15,
+                    hue=0.05,
                 ),
                 my.normalize_transform(),
             ]
         )
 
-        # Create and return the DataLoader
-        return DataLoader(self.dataset, batch_size=self.config.batch_size, shuffle=True)
+        return self.dataset
+
+
+    def get_dataloader(self) -> DataLoader:
+        dataset = self.get_dataset()
+
+        return DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+        )
+
 
 
 class Visualizer:
