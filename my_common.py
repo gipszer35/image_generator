@@ -42,7 +42,6 @@ def load_checkpoint(model, optimizer, path):
             print(f"Optimizer state not loaded: {e}")
 
 
-
 def load_checkpoint_if_exists(model, optimizer, path):
 
     if os.path.exists(path):
@@ -241,7 +240,10 @@ class SRLoss(nn.Module):
 
 
 def load_images_cropped(
-    directory_path, crop_size, max_num_patches_per_image, keep_first_full_scale
+    directory_path,
+    crop_size,
+    max_num_patches_per_image,
+    keep_first_full_scale,
 ):
     image_paths = [
         os.path.join(directory_path, fname)
@@ -253,53 +255,91 @@ def load_images_cropped(
 
     for path in image_paths:
         try:
-            img = Image.open(path).convert("RGB")
-            w, h = img.size
+            # Image is automatically closed when leaving this block
+            with Image.open(path) as img:
+                img = img.convert("RGB")
+                w, h = img.size
 
-            seen = set()
-            attempts = 0
-            max_attempts = max_num_patches_per_image * 2
+                seen = set()
+                attempts = 0
+                max_attempts = max_num_patches_per_image * 2
 
-            while len(seen) < max_num_patches_per_image and attempts < max_attempts:
-                attempts += 1
-                min_side = min(w, h)
+                while len(seen) < max_num_patches_per_image and attempts < max_attempts:
+                    attempts += 1
 
-                if min_side > crop_size:
-                    # First image: keep original size (no scaling)
-                    if keep_first_full_scale and not seen:
-                        scale = 1
-                    else:
-                        # Random scale that still allows a valid crop
-                        scale = (
-                            torch.empty(1).uniform_(crop_size / min_side, 1.0).item()
+                    min_side = min(w, h)
+
+                    if min_side > crop_size:
+                        if keep_first_full_scale and not seen:
+                            scale = 1.0
+                        else:
+                            scale = (
+                                torch.empty(1)
+                                .uniform_(crop_size / min_side, 1.0)
+                                .item()
+                            )
+
+                        new_w = int(w * scale)
+                        new_h = int(h * scale)
+
+                        resized = img.resize(
+                            (new_w, new_h),
+                            Image.Resampling.BICUBIC,
                         )
-                    new_w = int(w * scale)
-                    new_h = int(h * scale)
-                    resized = img.resize((new_w, new_h), Image.BICUBIC)
-                else:
-                    resized = img
-                    new_w, new_h = resized.size
+                    else:
+                        resized = img
+                        new_w, new_h = w, h
 
-                if new_w < crop_size or new_h < crop_size:
-                    continue
+                    if new_w < crop_size or new_h < crop_size:
+                        if resized is not img:
+                            resized.close()
+                        continue
 
-                img_tensor = TF.to_tensor(resized)
+                    top = torch.randint(0, new_h - crop_size + 1, (1,)).item()
 
-                top = torch.randint(0, new_h - crop_size + 1, (1,)).item()
-                left = torch.randint(0, new_w - crop_size + 1, (1,)).item()
+                    left = torch.randint(0, new_w - crop_size + 1, (1,)).item()
 
-                # Avoid duplicate crops
-                crop = img_tensor[:, top : top + crop_size, left : left + crop_size]
-                crop_np = crop.permute(1, 2, 0).numpy()
-                hsh = hashlib.md5(crop_np.tobytes()).hexdigest()
-                if hsh in seen:
-                    continue
-                seen.add(hsh)
+                    # Crop directly from PIL.
+                    # This avoids converting the entire resized image
+                    # to a large torch tensor.
+                    crop = resized.crop(
+                        (
+                            left,
+                            top,
+                            left + crop_size,
+                            top + crop_size,
+                        )
+                    )
 
-                cropped_images.append(crop_np)
+                    # Convert ONLY the crop to numpy.
+                    crop_np = np.asarray(crop, dtype=np.float32) / 255.0
+
+                    hsh = hashlib.md5(crop_np.tobytes()).hexdigest()
+
+                    if hsh in seen:
+                        del crop_np
+                        crop.close()
+
+                        if resized is not img:
+                            resized.close()
+
+                        continue
+
+                    seen.add(hsh)
+                    cropped_images.append(crop_np)
+
+                    crop.close()
+
+                    if resized is not img:
+                        resized.close()
+
+                    del crop_np
+
+                del seen
 
         except Exception as e:
             print(f"Failed to process image {path}: {e}")
+
 
     if cropped_images:
         return np.stack(cropped_images)
@@ -315,10 +355,18 @@ def cropped_dataset(
     keep_first_full_scale=False,
 ):
     cropped = load_images_cropped(
-        image_dir, crop_size, max_num_patches_per_image, keep_first_full_scale
+        image_dir,
+        crop_size,
+        max_num_patches_per_image,
+        keep_first_full_scale,
     )
-    cropped_dataset = CroppedImageDataset(cropped, transform=transform)
-    return cropped_dataset
+
+    dataset = CroppedImageDataset(
+        cropped,
+        transform=transform,
+    )
+
+    return dataset
 
 
 def cifar100_dataset(root="./data"):

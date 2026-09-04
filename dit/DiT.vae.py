@@ -29,15 +29,18 @@ class Config:
     work_dir: str
     batch_size: int
     images_dir: str
+    content_drive: str
 
     data_representation: str = "latent"
     vae_model_name: str = "stabilityai/sd-vae-ft-ema"
     image_size: int = 256
     latent_image_size: int = 32
+    crop_size: int = 512
     latent_scale: float = 0.18215
     num_heads: int = 8
     dim: int = 512
     dit_depth: int = 10
+    lr: float = 1e-5
 
     @property
     def latent_image_dir(self):
@@ -66,6 +69,7 @@ def create_config() -> Config:
         work_dir=work_dir,
         batch_size=batch_size,
         images_dir=images_dir,
+        content_drive=content_drive
     )
 
 
@@ -113,7 +117,7 @@ def debug_diffusion(real, x_t, x0_pred, ema_cleared, from_pure_noise):
         x_max = x.max()
         return (x - x_min) / (x_max - x_min + 1e-8)
 
-    _, axes = plt.subplots(1, 4, figsize=(12, 3))
+    _, axes = plt.subplots(1, 4, figsize=(24, 6), dpi=150)
 
     class Visualizer:
         def __init__(self):
@@ -138,7 +142,8 @@ def debug_diffusion(real, x_t, x0_pred, ema_cleared, from_pure_noise):
     plt.tight_layout()
     plt.show()
 
-    _, ax = plt.subplots()
+    # Full-size result
+    _, ax = plt.subplots(figsize=(8, 8))
     visualizer.show(ax, from_pure_noise, "From pure noise")
     plt.show()
 
@@ -206,10 +211,9 @@ class ImageLatentManager:
             logger.info("Creating latents from dataset...")
             dataset = my.cropped_dataset(
                 config.images_dir,
-                crop_size=512,
-                max_num_patches_per_image=2,
+                crop_size=config.crop_size,
+                max_num_patches_per_image=1,
                 transform=self.transform,
-                keep_first_full_scale=True,
             )
             os.makedirs(self.latent_dir)
             dataloader = DataLoader(dataset, batch_size=4, shuffle=False)
@@ -645,7 +649,7 @@ class DiffusionTrainer:
         )
 
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=0.00001, weight_decay=0.01
+            self.model.parameters(), lr=config.lr, weight_decay=0.01
         )
         self.scheduler = LambdaLR(self.optimizer, self.lr_lambda)
 
@@ -683,6 +687,8 @@ def train():
 
 if __name__ == "__main__":
     logger.info(f"Batch size: {config.batch_size}")
+    logger.info(f"LR: {config.lr}")
+
     torch.cuda.empty_cache()
 
     train()
