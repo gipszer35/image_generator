@@ -1,4 +1,4 @@
-!pip install ema-pytorch
+!pip install ema-pytorch > /dev/null 2>&1
 
 import torch
 import torch.nn as nn
@@ -34,13 +34,13 @@ class Config:
     data_representation: str = "latent"
     vae_model_name: str = "stabilityai/sd-vae-ft-ema"
     image_size: int = 256
-    latent_image_size: int = 32
-    crop_size: int = 512
+    crop_size: int = 512 + 256 + 128
+    latent_image_size: int = 64 + 32
     latent_scale: float = 0.18215
     num_heads: int = 8
     dim: int = 512
     dit_depth: int = 10
-    lr: float = 1e-5
+    lr: float = 5e-6
 
     @property
     def latent_image_dir(self):
@@ -48,7 +48,7 @@ class Config:
 
     @property
     def dit_checkpoint_path(self):
-        return os.path.join(self.work_dir, "DiT.vae.pt")
+        return os.path.join(self.work_dir, "DiT.vae.768.pt")
 
 
 def create_config() -> Config:
@@ -57,7 +57,7 @@ def create_config() -> Config:
         root_dir = os.path.join(content_drive, "MyDrive")
         work_dir = os.path.join(root_dir, "ImageGenerator", "dit")
         images_dir = os.path.join(root_dir, "images")
-        batch_size = 96
+        batch_size = 12
     else:
         root_dir = "../"
         work_dir = "./"
@@ -69,7 +69,7 @@ def create_config() -> Config:
         work_dir=work_dir,
         batch_size=batch_size,
         images_dir=images_dir,
-        content_drive=content_drive
+        content_drive=content_drive,
     )
 
 
@@ -109,43 +109,6 @@ def get_input_shape():
             f"Unknown data representation type: {config.data_representation}"
         )
     return shapes[config.data_representation]
-
-
-def debug_diffusion(real, x_t, x0_pred, ema_cleared, from_pure_noise):
-    def normalize(x):
-        x_min = x.min()
-        x_max = x.max()
-        return (x - x_min) / (x_max - x_min + 1e-8)
-
-    _, axes = plt.subplots(1, 4, figsize=(24, 6), dpi=150)
-
-    class Visualizer:
-        def __init__(self):
-            self.vae = ImageLatentManager.VAEManager(config.vae_model_name).create_vae()
-
-        def show(self, ax, img, title):
-            if isinstance(img, torch.Tensor):
-                img = img.detach().cpu()
-            pil_img = ImageLatentManager.latent_to_image(self.vae, img)
-            ax.imshow(pil_img)
-
-            ax.set_title(title)
-            ax.axis("off")
-
-    visualizer = Visualizer()
-
-    visualizer.show(axes[0], real, "Real")
-    visualizer.show(axes[1], x_t, "Noised")
-    visualizer.show(axes[2], x0_pred, "Cleaned")
-    visualizer.show(axes[3], ema_cleared, "Ema Cleaned")
-
-    plt.tight_layout()
-    plt.show()
-
-    # Full-size result
-    _, ax = plt.subplots(figsize=(8, 8))
-    visualizer.show(ax, from_pure_noise, "From pure noise")
-    plt.show()
 
 
 class ImageLatentManager:
@@ -503,6 +466,44 @@ class DiffusionTrainer:
             return 0.01 + 0.99 * (current_step / warmup_steps)  # linear warmup
         return 1.0
 
+    def debug_diffusion(self, real, x_t, x0_pred, ema_cleared, from_pure_noise):
+        def normalize(x):
+            x_min = x.min()
+            x_max = x.max()
+            return (x - x_min) / (x_max - x_min + 1e-8)
+
+        _, axes = plt.subplots(1, 4, figsize=(24, 6), dpi=150)
+
+        class Visualizer:
+            def __init__(self):
+                self.vae = ImageLatentManager.VAEManager(
+                    config.vae_model_name
+                ).create_vae()
+
+            def show(self, ax, img, title):
+                if isinstance(img, torch.Tensor):
+                    img = img.detach().cpu()
+                pil_img = ImageLatentManager.latent_to_image(self.vae, img)
+                ax.imshow(pil_img)
+
+                ax.set_title(title)
+                ax.axis("off")
+
+        visualizer = Visualizer()
+
+        visualizer.show(axes[0], real, "Real")
+        visualizer.show(axes[1], x_t, "Noised")
+        visualizer.show(axes[2], x0_pred, "Cleaned")
+        visualizer.show(axes[3], ema_cleared, "Ema Cleaned")
+
+        plt.tight_layout()
+        plt.show()
+
+        # Full-size result
+        _, ax = plt.subplots(figsize=(8, 8))
+        visualizer.show(ax, from_pure_noise, "From pure noise")
+        plt.show()
+
     def log_basic_info(self, epoch):
         now = datetime.datetime.now()
         logger.info(f"Current date and time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -531,7 +532,7 @@ class DiffusionTrainer:
         from_pure_noise = self.generate_image_from_pure_noise()
         logger.info(f"Finished generating from pure noise. {datetime.datetime.now()}")
 
-        debug_diffusion(real, x_t, x0_pred, ema_x0_pred, from_pure_noise)
+        self.debug_diffusion(real, x_t, x0_pred, ema_x0_pred, from_pure_noise)
 
     def get_alpha_bar(self, t):
         return self.alpha_bar[t].view(-1, 1, 1, 1)
@@ -587,13 +588,14 @@ class DiffusionTrainer:
         pred_noise = self.model(x_t, t)
         loss = ((pred_noise - noise) ** 2).mean()
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self.scheduler.step()
-        self.ema.update()
-
-        if self.step % 20 == 0:
+        accumulation_steps = 16
+        (loss / accumulation_steps).backward()
+        if self.step % accumulation_steps == accumulation_steps - 1:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            self.scheduler.step()
+            self.ema.update()
+        if self.step % accumulation_steps * 7 == 0:
             with torch.no_grad():  # Saves memory!
                 self.save_checkpoint()
                 ema_pred_noise = self.ema.ema_model(x_t, t)

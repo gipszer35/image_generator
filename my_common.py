@@ -52,17 +52,61 @@ def load_checkpoint_if_exists(model, optimizer, path):
     return model, optimizer
 
 
-def print_parameter_summary(model):
-    print(f"{'Parameter':40s} {'Shape':20s} {'# Params'}")
-    print("-" * 70)
-    total = 0
-    for name, p in model.named_parameters():
-        n = p.numel()
-        total += n
-        print(f"{name:40s} {str(list(p.shape)):20s} {n}")
-    print("-" * 70)
-    print("Total parameters:", total)
+def print_parameter_summary(model, detailed=True):
 
+    def print_basic_summary():
+        # Prints the structural overview: names, shapes, and counts
+        print(f"{'Parameter':40s} {'Shape':20s} {'# Params'}")
+        print("-" * 70)
+        total = 0
+        for name, p in model.named_parameters():
+            n = p.numel()
+            total += n
+            print(f"{name:40s} {str(list(p.shape)):20s} {n}")
+        print("-" * 70)
+        print("Total parameters:", total)
+        print("\n" + "=" * 80 + "\n")
+
+    def print_detailed_stats():
+        header = f"{'Parameter':40s} {'Type':12s} {'Req Grad':10s} {'Mean':10s} {'Std':10s} {'Min':10s} {'Max':10s}"
+        print(header)
+        print("-" * len(header))
+
+        total_params = 0
+        trainable_params = 0
+        total_memory_bytes = 0
+
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                n = p.numel()
+                total_params += n
+                if p.requires_grad:
+                    trainable_params += n
+
+                total_memory_bytes += n * p.element_size()
+
+                dtype_str = str(p.dtype).split(".")[-1]
+                req_grad_str = "True" if p.requires_grad else "False"
+
+                # Compute statistics safely
+                p_flat = p.detach().cpu().float()
+                p_mean = p_flat.mean().item()
+                p_std = p_flat.std().item()  # Standard Deviation
+                p_min = p_flat.min().item()
+                p_max = p_flat.max().item()
+
+                print(
+                    f"{name:40s} {dtype_str:12s} {req_grad_str:10s} {p_mean:<10.4f} {p_std:<10.4f} {p_min:<10.4f} {p_max:<10.4f}"
+                )
+
+        print("-" * len(header))
+        print(f"Trainable parameters: {trainable_params:,}")
+        print(f"Frozen parameters:    {total_params - trainable_params:,}")
+        print(f"Model Memory Size:    {total_memory_bytes / (1024 ** 2):.2f} MB")
+
+    print_basic_summary()
+    if detailed:
+        print_detailed_stats()
 
 class GaussianNoise(nn.Module):
     def __init__(self, sigma=0.1):
@@ -339,7 +383,6 @@ def load_images_cropped(
 
         except Exception as e:
             print(f"Failed to process image {path}: {e}")
-
 
     if cropped_images:
         return np.stack(cropped_images)
